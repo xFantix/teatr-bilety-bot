@@ -23,6 +23,7 @@ SHOWS_FILE = ROOT / "shows.json"
 STATE_FILE = ROOT / "state.json"
 USER_AGENT = "Mozilla/5.0 (teatr-bilety-bot; sprawdza wolne miejsca)"
 MAX_SEATS_LISTED = 10
+MIN_FREE_SEATS = 2  # ile biletów potrzebujemy - rzadziej nie ma sensu powiadamiać
 
 
 def fetch(opener, url, referer=None):
@@ -89,7 +90,9 @@ def notify(message):
 
 def main():
     shows = json.loads(SHOWS_FILE.read_text())
-    state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+    old_state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+    state = {}
+    new_shows = []
     failed = False
 
     for url in shows:
@@ -98,14 +101,16 @@ def main():
         except Exception as e:
             print(f"BŁĄD {url}: {e}", file=sys.stderr)
             failed = True
+            if url in old_state:
+                state[url] = old_state[url]
             continue
 
-        previous = state.get(url)
+        previous = old_state.get(url)
         print(f"{title}: {len(free)} wolnych (poprzednio: {previous})")
 
         if previous is None:
-            notify(f"👀 Obserwuję: {title}\nWolnych miejsc teraz: {len(free)}\n{url}")
-        elif len(free) > previous:
+            new_shows.append(f"• {title}: {len(free)} wolnych")
+        elif len(free) > previous and len(free) >= MIN_FREE_SEATS:
             seats = "\n".join(f"• {s}" for s in free[:MAX_SEATS_LISTED])
             more = f"\n…i {len(free) - MAX_SEATS_LISTED} więcej" if len(free) > MAX_SEATS_LISTED else ""
             notify(
@@ -113,6 +118,12 @@ def main():
                 f"Wolnych: {len(free)} (było {previous})\n{seats}{more}\n\nKup: {url}"
             )
         state[url] = len(free)
+
+    if new_shows:
+        notify(
+            f"👀 Obserwuję {len(new_shows)} termin(ów), powiadomię gdy będzie min. {MIN_FREE_SEATS} wolnych:\n"
+            + "\n".join(new_shows)
+        )
 
     STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n")
     return 1 if failed else 0
