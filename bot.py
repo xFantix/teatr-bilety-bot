@@ -36,7 +36,7 @@ def fetch(opener, url, referer=None):
 
 
 def check_show(url):
-    """Zwraca (tytuł, lista wolnych miejsc) dla linku "Kup bilet"."""
+    """Zwraca (tytuł, liczba wolnych miejsc, bloki sąsiednich wolnych miejsc) dla linku "Kup bilet"."""
     # Endpoint z miejscami wymaga sesji założonej przez stronę wyboru miejsc.
     opener = urllib.request.build_opener(
         urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
@@ -62,18 +62,53 @@ def check_show(url):
         raise RuntimeError("pusta lista miejsc")
 
     # Klasa "w ..." = wolne, "z" = zajęte.
-    free = [describe_seat(s["title"]) for s in data["miejsca"] if s["class"].split()[0] == "w"]
-    return title, free
+    free = [s for s in data["miejsca"] if s["class"].split()[0] == "w"]
+    return title, len(free), adjacent_blocks(page, free)
 
 
-def describe_seat(title):
+def adjacent_blocks(page, free):
+    """Grupuje wolne miejsca w bloki stojące obok siebie i zwraca te z min. MIN_FREE_SEATS miejscami.
+
+    Sąsiedztwo liczymy z planu sali (SVG), nie z numerów - numeracja bywa nieparzyste/parzyste po
+    przeciwnych stronach. Miejsca w rzędzie mają ten sam y i stały odstęp, przejścia są dużo szersze.
+    """
+    positions = {}
+    for attrs in re.findall(r'<rect([^>]*class="miejsce[^"]*"[^>]*)>', page):
+        a = dict(re.findall(r'(\w+)="([^"]*)"', attrs))
+        positions[a["id"]] = (float(a["y"]), float(a["x"]), float(a["width"]))
+
+    seats = sorted(
+        (positions[str(s["id"])], s["title"]) for s in free if str(s["id"]) in positions
+    )
+    blocks = []
+    prev = None
+    for (y, x, width), title in seats:
+        if prev and prev[0] == y and x - prev[1] <= width * 1.5:
+            blocks[-1].append(title)
+        else:
+            blocks.append([title])
+        prev = (y, x)
+    return [b for b in blocks if len(b) >= MIN_FREE_SEATS]
+
+
+def parse_seat(title):
     # title wygląda jak "Rząd:&nbsp;1;Miejsce:&nbsp;2<br />...<td>bilet normalny II</td><td>170 zł</td>..."
     text = html.unescape(title).replace("\xa0", " ")
     row = re.search(r"Rząd:\s*([^;<]+)", text)
     seat = re.search(r"Miejsce:\s*([^;<]+)", text)
     price = re.search(r"<td>([\d ,]+zł)</td>", text)
-    desc = f"rząd {row.group(1).strip()}, miejsce {seat.group(1).strip()}" if row and seat else "miejsce"
-    return f"{desc} ({price.group(1)})" if price else desc
+    return (
+        row.group(1).strip() if row else "?",
+        seat.group(1).strip() if seat else "?",
+        price.group(1) if price else None,
+    )
+
+
+def describe_block(block):
+    seats = [parse_seat(t) for t in block]
+    numbers = ", ".join(s[1] for s in seats)
+    prices = sorted({s[2] for s in seats if s[2]})
+    return f"rząd {seats[0][0]}, miejsca {numbers}" + (f" ({' / '.join(prices)})" if prices else "")
 
 
 def notify(message):
@@ -97,7 +132,7 @@ def main():
 
     for url in shows:
         try:
-            title, free = check_show(url)
+            title, free_count, blocks = check_show(url)
         except Exception as e:
             print(f"BŁĄD {url}: {e}", file=sys.stderr)
             failed = True
@@ -105,23 +140,24 @@ def main():
                 state[url] = old_state[url]
             continue
 
+        # Stan = liczba wolnych miejsc w blokach min. MIN_FREE_SEATS sąsiednich miejsc.
+        together = sum(len(b) for b in blocks)
         previous = old_state.get(url)
-        print(f"{title}: {len(free)} wolnych (poprzednio: {previous})")
+        print(f"{title}: {free_count} wolnych, {together} obok siebie (poprzednio: {previous})")
 
         if previous is None:
-            new_shows.append(f"• {title}: {len(free)} wolnych")
-        elif len(free) > previous and len(free) >= MIN_FREE_SEATS:
-            seats = "\n".join(f"• {s}" for s in free[:MAX_SEATS_LISTED])
-            more = f"\n…i {len(free) - MAX_SEATS_LISTED} więcej" if len(free) > MAX_SEATS_LISTED else ""
+            new_shows.append(f"• {title}: {free_count} wolnych, {len(blocks)} bloków obok siebie")
+        elif together > previous:
+            lines = "\n".join(f"• {describe_block(b)}" for b in blocks[:MAX_SEATS_LISTED])
+            more = f"\n…i {len(blocks) - MAX_SEATS_LISTED} więcej" if len(blocks) > MAX_SEATS_LISTED else ""
             notify(
-                f"🎭 Zwolniły się miejsca: {title}\n"
-                f"Wolnych: {len(free)} (było {previous})\n{seats}{more}\n\nKup: {url}"
+                f"🎭 Są min. {MIN_FREE_SEATS} miejsca obok siebie: {title}\n{lines}{more}\n\nKup: {url}"
             )
-        state[url] = len(free)
+        state[url] = together
 
     if new_shows:
         notify(
-            f"👀 Obserwuję {len(new_shows)} termin(ów), powiadomię gdy będzie min. {MIN_FREE_SEATS} wolnych:\n"
+            f"👀 Obserwuję {len(new_shows)} termin(ów), powiadomię gdy będzie min. {MIN_FREE_SEATS} miejsc obok siebie:\n"
             + "\n".join(new_shows)
         )
 
